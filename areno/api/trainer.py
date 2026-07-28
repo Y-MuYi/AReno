@@ -326,12 +326,16 @@ class Trainer:
         loss_fn: Callable,
         mini_bs: int = 8,
         gradient_accumulation_steps: int | None = None,
+        overlength_counts: dict[str, int] | None = None,
     ) -> dict[str, float]:
         """Run one backend training step with a caller-provided loss function.
 
         Returns whatever scalar metric dict the backend produces; when a
         `MetricsRecorder` is attached the dict and the accumulated step timings
-        are also dispatched to TensorBoard.
+        are also dispatched to TensorBoard. ``overlength_counts`` is an optional
+        agentic-only per-reason tally forwarded to the recorder so
+        ``rollout/overlength_*`` scalars reflect the rollout that produced this
+        batch; non-agentic callers leave it ``None``.
         """
 
         if not callable(loss_fn):
@@ -352,6 +356,7 @@ class Trainer:
                 train_result=result,
                 train_batch=batch_data,
                 timings=self._metric_timings,
+                overlength_counts=overlength_counts,
             )
         self.finish_step()
         return result

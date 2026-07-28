@@ -89,6 +89,7 @@ class PolicyOnlyTrainer:
                     train_batch, rewards_all, rollout_logprobs = self._materialize_agentic_train_batch(
                         tokenizer, prompt_batch, agent_batch
                     )
+                    overlength_counts = dict(agent_batch.overlength_counts)
                 else:
                     # 1) Sample n_samples completions per prompt; ordering
                     #    matches `prompt_batch.items` so we can zip downstream.
@@ -102,6 +103,7 @@ class PolicyOnlyTrainer:
                     train_batch, rewards_all, rollout_logprobs = self._materialize_train_batch(
                         tokenizer, prompt_batch, rollout_results
                     )
+                    overlength_counts = None
 
                 if rewards_all:
                     self.logger.info(
@@ -141,6 +143,7 @@ class PolicyOnlyTrainer:
                         self.loss_fn,
                         mini_bs=self.config.mini_bs,
                         gradient_accumulation_steps=self.config.gradient_accumulation_steps,
+                        overlength_counts=overlength_counts,
                     )
                     train_time_s = time.perf_counter() - train_start
                     if isinstance(result, dict):
@@ -231,6 +234,7 @@ class PolicyOnlyTrainer:
             samples, filtered_count, filter_diagnostics = self._filter_overlong_agent_samples(
                 ctx, samples, sampling_params
             )
+            overlength_counts = _aggregate_overlength_counts(samples)
             expected = len(agent_batch)
             if len(samples) + filtered_count != expected:
                 raise RuntimeError(
@@ -263,9 +267,15 @@ class PolicyOnlyTrainer:
                 rewards=rewards,
                 records=[sample.item.record for sample in samples],
                 reward_records=reward_records,
+                overlength_counts=overlength_counts,
             )
 
     def _filter_overlong_agent_samples(self, ctx, samples, sampling_params):
+        # Whole-trajectory backstop: under the safe-stop policy the proxy already
+        # stops items at the overlength turn, so this filter should rarely drop
+        # anything. It is retained for the ``off`` policy (which keeps partial
+        # tool calls) and as a defensive guard when user ``run_agent`` code
+        # ignores the ``finish_reason="length"`` terminal signal.
         max_context_len = self._agent_model_context_len()
         if max_context_len is None:
             return samples, 0, {}
@@ -303,6 +313,7 @@ class PolicyOnlyTrainer:
             "tool_results": tool_result_count,
             "response_tokens": len(sample.response_tokens),
             "trace_events": len(sample.trace),
+            "termination_reason": sample.termination_reason,
             "prompt": str(sample.item.prompt).replace("\n", "\\n")[:120],
         }
 
@@ -326,7 +337,9 @@ class PolicyOnlyTrainer:
         top = "; ".join(
             "prompt_idx={prompt_idx} sample_idx={sample_idx} tokens={tokens} messages={messages} "
             "assistant_messages={assistant_messages} tool_results={tool_results} response_tokens={response_tokens} "
-            "trace_events={trace_events} prompt='{prompt}'".format(**detail)
+            "trace_events={trace_events} termination_reason={termination_reason} prompt='{prompt}'".format(
+                **{"termination_reason": "none", **detail}
+            )
             for detail in diagnostics.get("top", [])
         )
         return (
@@ -581,3 +594,20 @@ class PolicyOnlyTrainer:
         record_dashboard_state(
             self.areno, stage="save_checkpoint_end", epoch=epoch, step=step, role=self._policy_role_name()
         )
+
+
+def _aggregate_overlength_counts(samples) -> dict[str, int]:
+    """Tally per-sample termination reasons into a per-reason count dict.
+
+    Only agentic overlength reasons (``generation_limit`` / ``context_limit`` /
+    ``oversized_tool_result``) are counted; ``None`` (clean stop) samples are
+    skipped so the dict stays empty for batches that never hit a cap.
+    """
+
+    reasons = ("generation_limit", "context_limit", "oversized_tool_result")
+    counts = {reason: 0 for reason in reasons}
+    for sample in samples:
+        reason = getattr(sample, "termination_reason", None)
+        if reason in counts:
+            counts[reason] += 1
+    return {reason: counts[reason] for reason in reasons if counts[reason]}

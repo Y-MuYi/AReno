@@ -116,6 +116,9 @@ class AgentTrainBatch:
     rewards: list[float] | None
     records: list[dict[str, Any]]
     reward_records: list[RewardRecord]
+    # Per-reason overlength counts (e.g. {"generation_limit": 2}) for the
+    # batch. Additive: empty by default so non-agentic callers are unaffected.
+    overlength_counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -131,6 +134,10 @@ class AgentTrajectoryTurn:
     model: str = "policy"
     tools: list[dict[str, Any]] = field(default_factory=list)
     tool_choice: Any = None
+    # Why this turn ended (``"generation_limit"`` / ``"context_limit"`` /
+    # ``"oversized_tool_result"``) or ``None`` for a clean stop. Additive
+    # observability populated from the proxy ``areno`` metadata block.
+    termination_reason: str | None = None
 
     def __post_init__(self) -> None:
         if self.response is None:
@@ -139,6 +146,7 @@ class AgentTrajectoryTurn:
         self.response_tokens = list(metadata["response_tokens"])
         self.response_logprobs = [float(value) for value in metadata["response_logprobs"]]
         self.parsed_tool_calls = _chat_response_message_tool_calls(self.response)
+        self.termination_reason = metadata.get("termination_reason")
 
 
 @dataclass(slots=True)
@@ -164,6 +172,7 @@ class _AgentSample:
     response_mask_row: list[bool] = field(default_factory=list)
     loss_mask_row: list[bool] = field(default_factory=list)
     rollout_logprobs_row: list[float] = field(default_factory=list)
+    termination_reason: str | None = None
 
 
 @dataclass(slots=True)
@@ -367,7 +376,11 @@ class RolloutSession:
             logprobs=sample.response_logprobs,
             loss_mask=self._response_loss_mask(sample),
             source_record=sample.item.record,
-            metadata={"prompt_index": sample.item.prompt_index, "sample_index": sample.item.sample_index},
+            metadata={
+                "prompt_index": sample.item.prompt_index,
+                "sample_index": sample.item.sample_index,
+                "termination_reason": sample.termination_reason,
+            },
         )
 
     def _response_loss_mask(self, sample: _AgentSample) -> list[bool]:
@@ -503,10 +516,18 @@ class RolloutSession:
             )
             max_context_len = _max_context_len(pending.params)
             if max_context_len is not None and len(pending.input_tokens) > max_context_len:
+                # Pre-generation short-circuit: the rendered context already
+                # exceeds the cap. Classify whether the *last tool result* alone
+                # accounts for the overflow (oversized_tool_result) or whether
+                # the accumulated trajectory simply grew too long (context_limit).
+                termination_reason = _classify_pre_generation_overlength(
+                    tokenizer, pending.messages, max_context_len
+                )
                 response = _filtered_chat_response(
                     model=pending.model,
                     prompt_tokens=len(pending.input_tokens),
                     max_sequence_len=max_context_len,
+                    termination_reason=termination_reason,
                 )
                 self._set_pending_response(pending, response)
                 return
@@ -520,6 +541,7 @@ class RolloutSession:
                     self._build_chat_response(
                         pending,
                         _ResponseData(response_tokens=sequence.resp_tokens, response_logprobs=sequence.resp_logprobs),
+                        engine_finish_reason=getattr(sequence, "finish_reason", "") or "",
                     ),
                 )
         except BaseException as exc:
@@ -548,6 +570,7 @@ class RolloutSession:
             pending,
             _ResponseData(response_tokens=list(turn.response_tokens), response_logprobs=list(turn.response_logprobs)),
             tool_calls=turn.parsed_tool_calls,
+            termination_reason=turn.termination_reason,
         )
 
     def _set_pending_response(self, pending: _PendingChat, response: dict[str, Any]) -> None:
@@ -572,6 +595,7 @@ class RolloutSession:
         response: _ResponseData,
         *,
         tool_calls: list[dict[str, Any]] | None = None,
+        termination_reason: str | None = None,
     ) -> _AgentSample:
         if pending.item is None:
             raise ValueError("explicit agent trajectory turn requires an AgentItem")
@@ -589,10 +613,14 @@ class RolloutSession:
         ]
         if not events:
             events = [RewardEvent(type=response_kind, text=content)]
+        finish_reason = "length" if termination_reason else "stop"
         trace = [
             RewardEvent(type="request", messages=pending.messages),
             *events,
-            RewardEvent(type="finish", metadata={"finish_reason": "stop"}),
+            RewardEvent(
+                type="finish",
+                metadata={"finish_reason": finish_reason, "termination_reason": termination_reason},
+            ),
         ]
         sample = _AgentSample(
             item=pending.item,
@@ -605,6 +633,7 @@ class RolloutSession:
             trace=trace,
             response_kind=response_kind,
             loss_mask_override=_tool_call_loss_mask(tokenizer, response.response_tokens) if tool_calls else None,
+            termination_reason=termination_reason,
         )
         # The prompt tokens are the fully rendered chat context for this turn,
         # including prior assistant/tool messages. Those context tokens are
@@ -612,17 +641,43 @@ class RolloutSession:
         self._set_sample_training_row(sample, pending.input_tokens)
         return sample
 
-    def _build_chat_response(self, pending: _PendingChat, response: _ResponseData) -> dict[str, Any]:
+    def _build_chat_response(
+        self,
+        pending: _PendingChat,
+        response: _ResponseData,
+        *,
+        engine_finish_reason: str = "",
+    ) -> dict[str, Any]:
         tokenizer = self._trainer.get_tokenizer()
         content = tokenizer.decode(response.response_tokens)
         tool_parse = self._tool_call_parser.parse(content, pending.tools, pending.tool_choice)
+        tool_calls = list(tool_parse.tool_calls)
+        termination_reason: str | None = None
+        force_finish_reason: str | None = None
+        if _is_generation_limit(response.response_tokens, engine_finish_reason, pending.params):
+            termination_reason = "generation_limit"
+            # safe-stop: drop a half-finished tool call so the trajectory never
+            # records an un-executable partial call, and surface ``length`` as
+            # the terminal finish reason. ``off`` keeps today's behavior: the
+            # parsed tool_calls survive and finish_reason follows the normal
+            # tool_calls/stop derivation; termination_reason stays observable.
+            if self._agent_overlength_policy() == "safe-stop":
+                tool_calls = []
+                force_finish_reason = "length"
         return self._build_pending_chat_response(
             pending,
             response.response_tokens,
             response_logprobs=response.response_logprobs,
             content=content,
-            tool_calls=tool_parse.tool_calls,
+            tool_calls=tool_calls,
+            termination_reason=termination_reason,
+            force_finish_reason=force_finish_reason,
         )
+
+    def _agent_overlength_policy(self) -> str:
+        """Return the configured overlength policy (``off`` when unset)."""
+
+        return str(getattr(self._trainer.config, "agent_overlength_policy", "off") or "off")
 
     def _append_sample_response(self, existing: _AgentSample, new_sample: _AgentSample) -> None:
         """Append another model response to an existing multi-call trajectory."""
@@ -641,6 +696,10 @@ class RolloutSession:
         existing.response_logprobs.extend(new_sample.response_logprobs)
         existing.trace.extend(new_sample.trace)
         existing.messages = new_sample.messages
+        # The last turn's termination reason wins so a multi-turn trajectory
+        # that ends on a generation-limit cutoff reports that reason, not an
+        # earlier clean stop.
+        existing.termination_reason = new_sample.termination_reason
         # Each later turn is rendered as: previous messages + new assistant.
         # Append only the suffix so the training row becomes one trajectory
         # instead of duplicating the shared prefix for every tool call.
@@ -683,6 +742,8 @@ class RolloutSession:
         response_logprobs: list[float] | None = None,
         content: str | None = None,
         tool_calls: list[dict[str, Any]] | None = None,
+        termination_reason: str | None = None,
+        force_finish_reason: str | None = None,
     ) -> dict[str, Any]:
         del content
         finish_reason = "tool_calls" if tool_calls else "stop"
@@ -699,6 +760,8 @@ class RolloutSession:
             response_logprobs=[list(response_logprobs or [])],
             include_areno_metadata=True,
             input_tokens=pending.input_tokens,
+            termination_reason=termination_reason,
+            force_finish_reason=force_finish_reason,
         )
 
 
@@ -816,7 +879,20 @@ def _max_context_len(params: Any) -> int | None:
     return int(max_prompt_len)
 
 
-def _filtered_chat_response(*, model: str, prompt_tokens: int, max_sequence_len: int) -> dict[str, Any]:
+def _filtered_chat_response(
+    *,
+    model: str,
+    prompt_tokens: int,
+    max_sequence_len: int,
+    termination_reason: str | None = None,
+) -> dict[str, Any]:
+    areno_meta: dict[str, Any] = {
+        "input_tokens": [],
+        "response_tokens": [],
+        "response_logprobs": [],
+    }
+    if termination_reason is not None:
+        areno_meta["termination_reason"] = termination_reason
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion",
@@ -835,12 +911,51 @@ def _filtered_chat_response(*, model: str, prompt_tokens: int, max_sequence_len:
             "total_tokens": prompt_tokens,
             "max_sequence_len": max_sequence_len,
         },
-        "areno": {
-            "input_tokens": [],
-            "response_tokens": [],
-            "response_logprobs": [],
-        },
+        "areno": areno_meta,
     }
+
+
+def _is_generation_limit(response_tokens: list[int], engine_finish_reason: str, params: Any) -> bool:
+    """Classify a generation-limit overlength from the propagated engine signal.
+
+    The engine ``finish_reason`` is authoritative when present (``"length"`` →
+    True, ``"stop"`` → False), so a clean stop at the last token is never
+    misclassified. When the backend did not fill the signal (empty/unset) we
+    fall back to a deterministic length heuristic against ``max_new_tokens``.
+    """
+
+    if engine_finish_reason == "length":
+        return True
+    if engine_finish_reason == "stop":
+        return False
+    max_new_tokens = int(getattr(params, "max_new_tokens", 0) or 0)
+    return max_new_tokens > 0 and len(response_tokens) >= max_new_tokens
+
+
+def _classify_pre_generation_overlength(
+    tokenizer: Any, messages: list[dict[str, Any]], max_context_len: int
+) -> str:
+    """Split a pre-generation context overflow into its cause.
+
+    Returns ``"oversized_tool_result"`` when the last ``role == "tool"``
+    message *on its own* already exceeds ``max_context_len`` tokens (the
+    trajectory is fine but a single tool result blew the cap); otherwise
+    ``"context_limit"`` (the accumulated trajectory simply grew too long).
+    """
+
+    for message in reversed(messages):
+        if message.get("role") != "tool":
+            continue
+        content = message.get("content")
+        text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+        try:
+            tool_tokens = tokenizer.encode(text)
+        except Exception:
+            return "context_limit"
+        if len(tool_tokens) > max_context_len:
+            return "oversized_tool_result"
+        return "context_limit"
+    return "context_limit"
 
 
 def _normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
