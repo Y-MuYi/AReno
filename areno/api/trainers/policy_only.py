@@ -218,6 +218,7 @@ class PolicyOnlyTrainer:
             loss_mask_policy=self._loss_mask_policy(),
             max_running_prompts=self.config.resolved_max_running_prompts(),
             timeout_s=self.config.agent_timeout_s,
+            agent_overlength_policy=self.config.agent_overlength_policy,
         ) as ctx:
             await ctx.sync_rollout_session_async()
             trajectories = await maybe_await(self._get_agent_run_fn()(ctx, agent_batch))

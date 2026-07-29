@@ -402,3 +402,54 @@ def test_overlength_exact_max_context_len_not_triggered():
     assert trainer.rollout_batches == [([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]], 1)]  # rollout called
     assert "termination_reason" not in response["areno"]  # no overlength classification
     assert response["choices"][0]["finish_reason"] == "stop"
+
+
+# ---------------------------------------------------------------------------
+# 10. regression: Trainer without a .config attribute must not raise
+#     (the real Trainer does not expose TrainerConfig; agent_overlength_policy
+#      is threaded in via rollout_session, not read off trainer.config)
+# ---------------------------------------------------------------------------
+
+
+def test_overlength_policy_trainer_without_config_attr_defaults_off():
+    """A trainer with no ``config`` attribute (like the real ``Trainer``) must
+    not raise ``AttributeError`` when the overlength policy is read -- the prior
+    implementation reached for ``self._trainer.config`` unguarded."""
+
+    trainer = _LengthFakeTrainer(finish_reason="length", resp_tokens=[101, 102, 103], world_size=1, tp_size=1)
+    del trainer.config  # mimic the real Trainer, which has no .config
+    trainer.tokenizer = _LiteralTokenizer('{"name":"foo","arguments":')
+    session = _session(trainer)  # no agent_overlength_policy threaded -> off
+
+    # _agent_overlength_policy() must not raise and must report "off".
+    assert session._agent_overlength_policy() == "off"
+
+    # A generation-limit rollout under "off" keeps the parsed tool call and does
+    # not raise mid-rollout (this is the 500 the bug produced in production).
+    response = _complete(session, {"model": "policy", "messages": [{"role": "user", "content": "go"}]})
+    assert response["areno"]["termination_reason"] == "generation_limit"
+    assert response["choices"][0]["finish_reason"] == "stop"  # off -> normal derivation, not "length"
+
+
+def test_overlength_policy_threaded_safe_stop_overrides_missing_config():
+    """When the policy is threaded in explicitly (the real agentic trainer
+    path), ``safe-stop`` takes effect even though the trainer has no ``.config``.
+    """
+
+    trainer = _LengthFakeTrainer(finish_reason="length", resp_tokens=[101, 102, 103], world_size=1, tp_size=1)
+    del trainer.config
+    trainer.tokenizer = _LiteralTokenizer('{"name":"foo","arguments":')
+    session = RolloutSession(
+        trainer,
+        sampling_params=_FakeSamplingParams(),
+        loss_mask_policy=LossMaskPolicy(),
+        max_running_prompts=1,
+        agent_overlength_policy="safe-stop",
+    )
+
+    assert session._agent_overlength_policy() == "safe-stop"
+
+    response = _complete(session, {"model": "policy", "messages": [{"role": "user", "content": "go"}]})
+    assert response["choices"][0]["finish_reason"] == "length"
+    assert response["areno"]["termination_reason"] == "generation_limit"
+    assert response["choices"][0]["message"].get("tool_calls") in (None, [])  # half tool call dropped

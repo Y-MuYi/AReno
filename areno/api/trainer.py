@@ -308,8 +308,15 @@ class Trainer:
         max_running_prompts: int | None = None,
         timeout_s: float = 300.0,
         proxy: bool = True,
+        agent_overlength_policy: str | None = None,
     ) -> RolloutSession:
-        """Create an async rollout session, optionally with an OpenAI-compatible proxy."""
+        """Create an async rollout session, optionally with an OpenAI-compatible proxy.
+
+        ``agent_overlength_policy`` is threaded in by agentic callers that hold
+        the ``TrainerConfig`` (the ``Trainer`` itself does not) so the proxy can
+        honor ``safe-stop`` without reaching for a ``config`` attribute it does
+        not expose; defaults to ``off`` to preserve prior behavior.
+        """
 
         return RolloutSession(
             self,
@@ -318,6 +325,7 @@ class Trainer:
             max_running_prompts=max_running_prompts,
             timeout_s=timeout_s,
             proxy=proxy,
+            agent_overlength_policy=agent_overlength_policy,
         )
 
     def train(

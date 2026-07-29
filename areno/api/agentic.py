@@ -260,10 +260,18 @@ class RolloutSession:
         max_running_prompts: int | None = None,
         timeout_s: float = 300.0,
         proxy: bool = True,
+        agent_overlength_policy: str | None = None,
     ) -> None:
         self._trainer = trainer
         self._sampling_params = sampling_params
         self._loss_mask_policy = loss_mask_policy or LossMaskPolicy()
+        # ``agent_overlength_policy`` lives on ``TrainerConfig`` which the
+        # ``Trainer`` instance we hold does not expose, so callers thread the
+        # resolved value in here; ``_agent_overlength_policy`` reads this rather
+        # than reaching for ``self._trainer.config`` (which does not exist).
+        # ``None`` means "not threaded in": fall back to ``trainer.config`` if a
+        # caller set it, else ``off``.
+        self._agent_overlength_policy_value = agent_overlength_policy
         self._tool_call_parser = get_tool_call_parser(infer_tool_call_parser_name(trainer))
         self._dp_size = max(_trainer_dp_size(trainer), 1)
         self._max_running_prompts = (
@@ -675,9 +683,21 @@ class RolloutSession:
         )
 
     def _agent_overlength_policy(self) -> str:
-        """Return the configured overlength policy (``off`` when unset)."""
+        """Return the configured overlength policy (``off`` when unset).
 
-        return str(getattr(self._trainer.config, "agent_overlength_policy", "off") or "off")
+        Prefers the value threaded in at construction (the path real agentic
+        trainers use, since ``Trainer`` does not expose ``TrainerConfig``); falls
+        back to ``self._trainer.config.agent_overlength_policy`` for callers that
+        set it directly on the trainer, and finally to ``off``. Never reaches for
+        ``trainer.config`` unguarded -- the ``Trainer`` object has no such
+        attribute and a bare access raises ``AttributeError`` mid-rollout.
+        """
+
+        value = self._agent_overlength_policy_value
+        if value in ("", None):
+            config = getattr(self._trainer, "config", None)
+            value = getattr(config, "agent_overlength_policy", "off")
+        return str(value or "off")
 
     def _append_sample_response(self, existing: _AgentSample, new_sample: _AgentSample) -> None:
         """Append another model response to an existing multi-call trajectory."""
@@ -1066,7 +1086,9 @@ def _trainer_dp_size(trainer: Any) -> int:
     try:
         return max(int(trainer.dp_size()), 1)
     except (AttributeError, RuntimeError):
-        config = trainer.config
+        config = getattr(trainer, "config", None)
+        if config is None:
+            return 1
         world_size = int(config.world_size or 1)
         tp_size = int(config.tp_size or 1)
         if tp_size <= 0:
