@@ -91,6 +91,8 @@ TRAIN_OPTION_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "agent_timeout_s",
             "train_tool_results",
             "agent_overlength_policy",
+            "agentic_context_overflow_policy",
+            "trim_max_tokens",
             "reward_fn_path",
             "reward_ckpt",
         ),
@@ -605,6 +607,8 @@ def _trainer_config_from_args(args) -> TrainerConfig:
     args.score_micro_bs = getattr(args, "score_micro_bs", 8)
     args.model_hub = getattr(args, "model_hub", "modelscope")
     args.agent_overlength_policy = getattr(args, "agent_overlength_policy", "off")
+    args.agentic_context_overflow_policy = getattr(args, "agentic_context_overflow_policy", "reject")
+    args.trim_max_tokens = getattr(args, "trim_max_tokens", None)
     algorithm = get_algorithm(args.algo)
     chat_template_enable_thinking = False if args.disable_thinking else None
     if algorithm.name == "dpo":
@@ -644,6 +648,8 @@ def _trainer_config_from_args(args) -> TrainerConfig:
             agent_fn=args.agent_fn,
             agent_timeout_s=args.agent_timeout_s,
             train_tool_results=args.train_tool_results,
+            agentic_context_overflow_policy=args.agentic_context_overflow_policy,
+            trim_max_tokens=args.trim_max_tokens,
             chat_template_enable_thinking=chat_template_enable_thinking,
             agent_overlength_policy=args.agent_overlength_policy,
             ref_ckpt=args.ref_ckpt,
@@ -686,6 +692,8 @@ def _trainer_config_from_args(args) -> TrainerConfig:
             agent_fn=args.agent_fn,
             agent_timeout_s=args.agent_timeout_s,
             train_tool_results=args.train_tool_results,
+            agentic_context_overflow_policy=args.agentic_context_overflow_policy,
+            trim_max_tokens=args.trim_max_tokens,
             chat_template_enable_thinking=chat_template_enable_thinking,
             agent_overlength_policy=args.agent_overlength_policy,
         )
@@ -735,6 +743,8 @@ def _trainer_config_from_args(args) -> TrainerConfig:
             agent_fn=args.agent_fn,
             agent_timeout_s=args.agent_timeout_s,
             train_tool_results=args.train_tool_results,
+            agentic_context_overflow_policy=args.agentic_context_overflow_policy,
+            trim_max_tokens=args.trim_max_tokens,
             chat_template_enable_thinking=chat_template_enable_thinking,
             agent_overlength_policy=args.agent_overlength_policy,
         )
@@ -797,6 +807,8 @@ def _trainer_config_from_args(args) -> TrainerConfig:
         agent_fn=args.agent_fn,
         agent_timeout_s=args.agent_timeout_s,
         train_tool_results=args.train_tool_results,
+        agentic_context_overflow_policy=args.agentic_context_overflow_policy,
+        trim_max_tokens=args.trim_max_tokens,
         chat_template_enable_thinking=chat_template_enable_thinking,
         agent_overlength_policy=args.agent_overlength_policy,
     )
@@ -914,6 +926,8 @@ def _training_config_settings(config: TrainerConfig) -> dict:
                 "agent_timeout_s",
                 "train_tool_results",
                 "agent_overlength_policy",
+                "agentic_context_overflow_policy",
+                "trim_max_tokens",
                 "reward_fn_path",
                 "reward_ckpt",
             ],
@@ -1320,6 +1334,27 @@ def _dataset_builder_for_suffix(suffix: str) -> str:
     help=(
         "Agentic overlength handling: off keeps current behavior; safe-stop drops half-finished "
         "tool calls / oversized tool results and stops the item while retaining the trajectory."
+    ),
+)
+@click.option(
+    "--agentic-context-overflow-policy",
+    type=click.Choice(["reject", "trim_messages"]),
+    default="reject",
+    show_default=True,
+    help=(
+        "Agentic proxy policy when the chat prompt exceeds context length. "
+        "'reject' returns an empty response; 'trim_messages' removes oldest "
+        "conversation units until the prompt fits."
+    ),
+)
+@click.option(
+    "--trim-max-tokens",
+    type=int,
+    default=None,
+    help=(
+        "Token limit for the proxy's trim_messages policy. When set, single "
+        "chat prompts exceeding this limit are trimmed. Defaults to --max-context-len "
+        "or the model's native limit when unset."
     ),
 )
 @click.option(

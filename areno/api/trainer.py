@@ -309,6 +309,8 @@ class Trainer:
         timeout_s: float = 300.0,
         proxy: bool = True,
         agent_overlength_policy: str | None = None,
+        agentic_context_overflow_policy: str = "reject",
+        trim_max_tokens: int | None = None,
     ) -> RolloutSession:
         """Create an async rollout session, optionally with an OpenAI-compatible proxy.
 
@@ -326,6 +328,8 @@ class Trainer:
             timeout_s=timeout_s,
             proxy=proxy,
             agent_overlength_policy=agent_overlength_policy,
+            agentic_context_overflow_policy=agentic_context_overflow_policy,
+            trim_max_tokens=trim_max_tokens,
         )
 
     def train(

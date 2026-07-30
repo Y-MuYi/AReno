@@ -59,6 +59,8 @@ class TrainerConfig:
     agent_fn: str | None = None
     agent_timeout_s: float = 300.0
     train_tool_results: bool = False
+    agentic_context_overflow_policy: str = "reject"
+    trim_max_tokens: int | None = None
     chat_template_enable_thinking: bool | None = None
     # Agentic overlength policy: ``off`` preserves today's behavior (parse and
     # keep tool calls even when generation hit the token limit; whole-trajectory
@@ -74,6 +76,11 @@ class TrainerConfig:
             raise ValueError("model_hub must be one of: hf, modelscope")
         if self.agent_overlength_policy not in {"off", "safe-stop"}:
             raise ValueError("agent_overlength_policy must be one of: off, safe-stop")
+        if self.agentic_context_overflow_policy not in ("reject", "trim_messages"):
+            raise ValueError(
+                f"agentic_context_overflow_policy must be 'reject' or 'trim_messages', "
+                f"got {self.agentic_context_overflow_policy!r}"
+            )
 
     def optimizer_config(self) -> dict:
         """Build the optimizer dict consumed by the backend config."""

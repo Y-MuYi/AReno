@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from areno.api.openai_chat import (
     build_chat_completion_response,
     first_user_text,
+    group_messages_into_units,
     messages_to_prompt_tokens,
     messages_to_text,
     normalize_messages,
@@ -139,6 +140,11 @@ class AgentTrajectoryTurn:
     # ``"oversized_tool_result"``) or ``None`` for a clean stop. Additive
     # observability populated from the proxy ``areno`` metadata block.
     termination_reason: str | None = None
+    # Trimmed-message list used by the ``trim_messages`` proxy policy: when the
+    # pre-generation overflow check dropped oldest conversation units, the
+    # training sample must be tokenized from this effective prompt, not the
+    # caller-owned ``messages`` list (which is never mutated in place).
+    effective_messages: list[dict[str, Any]] | None = None
 
     def __post_init__(self) -> None:
         if self.response is None:
@@ -221,6 +227,8 @@ class _PendingChat:
     response: dict[str, Any] | None = None
     error: BaseException | None = None
     cancelled: bool = False
+    _trimmed_messages: list[dict[str, Any]] | None = None
+    _trim_info: dict[str, Any] | None = None
 
 
 class _AgenticHTTPServer(ThreadingHTTPServer):
@@ -262,6 +270,8 @@ class RolloutSession:
         timeout_s: float = 300.0,
         proxy: bool = True,
         agent_overlength_policy: str | None = None,
+        agentic_context_overflow_policy: str = "reject",
+        trim_max_tokens: int | None = None,
     ) -> None:
         self._trainer = trainer
         self._sampling_params = sampling_params
@@ -286,6 +296,8 @@ class RolloutSession:
         self._closing = False
         self._base_url = ""
         self._proxy_enabled = bool(proxy)
+        self._agentic_context_overflow_policy = agentic_context_overflow_policy
+        self._trim_max_tokens = trim_max_tokens
 
     @property
     def max_running_prompts(self) -> int:
@@ -524,11 +536,60 @@ class RolloutSession:
                 fallback_prompt=_first_user_text(pending.messages),
             )
             max_context_len = _max_context_len(pending.params)
-            if max_context_len is not None and len(pending.input_tokens) > max_context_len:
-                # Pre-generation short-circuit: the rendered context already
-                # exceeds the cap. Classify whether the *last tool result* alone
-                # accounts for the overflow (oversized_tool_result) or whether
-                # the accumulated trajectory simply grew too long (context_limit).
+            # trim_messages: input-side overflow policy. Use the dedicated
+            # trim_max_tokens if set, otherwise fall back to max_context_len or
+            # the model's native limit.
+            if self._agentic_context_overflow_policy == "trim_messages":
+                trim_target = self._trim_max_tokens
+                if trim_target is None:
+                    trim_target = max_context_len
+                if trim_target is None:
+                    trim_target = _model_sequence_len(tokenizer)
+                if trim_target is not None and len(pending.input_tokens) > trim_target:
+                    trimmed = _trim_messages_to_fit(
+                        tokenizer,
+                        pending.messages,
+                        tools=pending.tools,
+                        max_context_len=trim_target,
+                        input_tokens=pending.input_tokens,
+                    )
+                    if trimmed is None:
+                        # Two failure modes: (a) no removable units at all
+                        # (system + user alone exceeds the budget) or
+                        # (b) all removable units removed but still too long.
+                        units = group_messages_into_units(pending.messages)
+                        if len(units) <= 2:
+                            raise RuntimeError(
+                                f"trim_messages impossible: system + latest user alone "
+                                f"({len(pending.input_tokens)} tokens) exceeds trim_max_tokens "
+                                f"({trim_target}). Increase --trim-max-tokens or "
+                                f"--agentic-context-overflow-policy."
+                            )
+                        response = _unfittable_chat_response(
+                            model=pending.model,
+                            prompt_tokens=len(pending.input_tokens),
+                            max_sequence_len=trim_target,
+                        )
+                        self._set_pending_response(pending, response)
+                        return
+                    pending.input_tokens = trimmed["tokens"]
+                    pending._trimmed_messages = trimmed["messages"]
+                    pending._trim_info = trimmed["diagnostics"]
+                    diag = trimmed["diagnostics"]
+                    logger.info(
+                        "trim_messages removed %d units (%d messages): %d -> %d tokens, system=%s",
+                        diag["units_removed"],
+                        diag["messages_removed"],
+                        diag["original_prompt_tokens"],
+                        diag["effective_prompt_tokens"],
+                        diag["preserved_instructions"],
+                    )
+            elif max_context_len is not None and len(pending.input_tokens) > max_context_len:
+                # Pre-generation short-circuit (reject policy or trim made no
+                # difference): the rendered context already exceeds the cap.
+                # Classify whether *any* tool result alone accounts for the
+                # overflow (oversized_tool_result) or whether the accumulated
+                # trajectory simply grew too long (context_limit).
                 termination_reason = _classify_pre_generation_overlength(
                     tokenizer, pending.messages, max_context_len
                 )
@@ -558,15 +619,16 @@ class RolloutSession:
 
     def _sample_from_trajectory_turn(self, turn: AgentTrajectoryTurn) -> _AgentSample:
         tokenizer = self._trainer.get_tokenizer()
+        messages_to_tokenize = turn.effective_messages if turn.effective_messages is not None else turn.messages
         input_tokens = _messages_to_prompt_tokens(
             tokenizer,
-            turn.messages,
+            messages_to_tokenize,
             tools=turn.tools,
             fallback_prompt=turn.item.prompt,
         )
         pending = _PendingChat(
             item=turn.item,
-            messages=_normalize_messages(turn.messages),
+            messages=_normalize_messages(messages_to_tokenize),
             input_tokens=input_tokens,
             params=self._sampling_params,
             key=_chat_batch_key(self._sampling_params),
@@ -768,7 +830,7 @@ class RolloutSession:
     ) -> dict[str, Any]:
         del content
         finish_reason = "tool_calls" if tool_calls else "stop"
-        return build_chat_completion_response(
+        result = build_chat_completion_response(
             tokenizer=self._trainer.get_tokenizer(),
             model=pending.model,
             prompt_tokens=len(pending.input_tokens),
@@ -784,6 +846,13 @@ class RolloutSession:
             termination_reason=termination_reason,
             force_finish_reason=force_finish_reason,
         )
+        trimmed_messages = getattr(pending, "_trimmed_messages", None)
+        trim_info = getattr(pending, "_trim_info", None)
+        if trimmed_messages is not None and isinstance(trim_info, dict):
+            result.setdefault("areno", {})
+            result["areno"]["effective_messages"] = trimmed_messages
+            result["areno"]["trim_info"] = trim_info
+        return result
 
 
 def load_agent_run_fn(path: str) -> Callable[[RolloutSession, AgentBatch], Any]:
@@ -900,6 +969,17 @@ def _max_context_len(params: Any) -> int | None:
     return int(max_prompt_len)
 
 
+def _model_sequence_len(tokenizer: Any) -> int | None:
+    """Return the model's maximum sequence length from its tokenizer config."""
+    max_seq = getattr(tokenizer, "model_max_length", None)
+    if max_seq is not None:
+        return int(max_seq)
+    max_pos = getattr(tokenizer, "max_position_embeddings", None)
+    if max_pos is not None:
+        return int(max_pos)
+    return None
+
+
 def _filtered_chat_response(
     *,
     model: str,
@@ -972,6 +1052,105 @@ def _classify_pre_generation_overlength(
         if single_message_token_count(tokenizer, message) > max_context_len:
             return "oversized_tool_result"
     return "context_limit"
+
+
+def _unfittable_chat_response(*, model: str, prompt_tokens: int, max_sequence_len: int) -> dict[str, Any]:
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": ""},
+                "finish_reason": "length",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": 0,
+            "total_tokens": prompt_tokens,
+            "max_sequence_len": max_sequence_len,
+        },
+        "areno": {
+            "input_tokens": [],
+            "response_tokens": [],
+            "response_logprobs": [],
+            "error": "context_overflow",
+            "detail": (
+                f"Prompt ({prompt_tokens} tokens) exceeds max ({max_sequence_len}) "
+                "even after removing all trimmable conversation units."
+            ),
+        },
+    }
+
+
+def _trim_messages_to_fit(
+    tokenizer: Any,
+    messages: list[dict[str, Any]],
+    *,
+    tools: list[dict[str, Any]] | None,
+    max_context_len: int,
+    input_tokens: list[int],
+) -> dict[str, Any] | None:
+    """Remove oldest conversation units until the prompt fits *max_context_len*.
+
+    Returns ``None`` when even the preserved (system/developer + latest user)
+    units still exceed the budget.
+    """
+
+    units = group_messages_into_units(messages)
+    if not units:
+        return None
+
+    # Determine preserved ranges.
+    preserved_start = 0
+    preserved_end = len(units) - 1
+
+    # Protect leading system / developer instructions.
+    if units[0] and units[0][0].get("role") in ("system", "developer"):
+        preserved_start = 1
+
+    # No removable units at all.
+    if preserved_start >= preserved_end:
+        return None
+
+    # Copy and trim the oldest removable units one by one.
+    current_units = list(units)
+    removed_unit_count = 0
+    removed_message_count = 0
+    has_preserved_instructions = preserved_start > 0
+
+    for _removable_idx in range(preserved_start, preserved_end):
+        # Pop the oldest removable unit (always at index preserved_start
+        # after earlier pops).
+        unit = current_units.pop(preserved_start)
+        removed_unit_count += 1
+        removed_message_count += len(unit)
+
+        candidate_messages = [msg for u in current_units for msg in u]
+        candidate_tokens = _messages_to_prompt_tokens(
+            tokenizer,
+            candidate_messages,
+            tools=tools,
+            fallback_prompt=_first_user_text(candidate_messages),
+        )
+        if len(candidate_tokens) <= max_context_len:
+            return {
+                "messages": candidate_messages,
+                "tokens": candidate_tokens,
+                "diagnostics": {
+                    "policy": "trim_messages",
+                    "original_prompt_tokens": len(input_tokens),
+                    "effective_prompt_tokens": len(candidate_tokens),
+                    "units_removed": removed_unit_count,
+                    "messages_removed": removed_message_count,
+                    "preserved_instructions": has_preserved_instructions,
+                },
+            }
+
+    return None
 
 
 def _normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
