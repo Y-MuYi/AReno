@@ -11,6 +11,7 @@ remaining GPU validation is documented in the troubleshooting page.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -453,3 +454,133 @@ def test_overlength_policy_threaded_safe_stop_overrides_missing_config():
     assert response["choices"][0]["finish_reason"] == "length"
     assert response["areno"]["termination_reason"] == "generation_limit"
     assert response["choices"][0]["message"].get("tool_calls") in (None, [])  # half tool call dropped
+
+
+# ---------------------------------------------------------------------------
+# 11. an oversized tool result that is NOT the last tool message is not missed
+# ---------------------------------------------------------------------------
+
+
+def test_overlength_earlier_oversized_tool_not_missed():
+    """An oversized tool result that is *not* the last tool message must still
+    classify as ``oversized_tool_result``. The prior short-circuiting classifier
+    only inspected the last tool message and would have mislabelled this
+    ``context_limit``."""
+    trainer = _FakeTrainer(world_size=1, tp_size=1)
+    trainer.config = SimpleNamespace(agent_overlength_policy="safe-stop", world_size=1, tp_size=1)
+    trainer.tokenizer = _CharTokenizer()
+    params = _FakeSamplingParams()
+    params.max_context_len = 10
+    session = _session(trainer, params=params)
+
+    messages = [
+        {"role": "user", "content": "a" * 15},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "name": "f", "content": "b" * 20},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_2", "type": "function", "function": {"name": "g", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "call_2", "name": "g", "content": "b" * 3},
+    ]
+
+    response = _complete(session, {"model": "policy", "messages": messages})
+
+    assert response["areno"]["termination_reason"] == "oversized_tool_result"
+    assert trainer.rollout_batches == []  # pre-generation short-circuit, no rollout
+
+
+# ---------------------------------------------------------------------------
+# 12. single_message_token_count is template-aware (口径 aligned with the total)
+# ---------------------------------------------------------------------------
+
+
+class _TemplateTokenizer(_FakeTokenizer):
+    """A tokenizer with a chat template: wraps each message with role-tag
+    markers so the rendered count exceeds the raw content length."""
+
+    chat_template = "fake"
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False, **kwargs):
+        ids = [100]  # opening role-tag marker
+        for message in messages:
+            content = message.get("content")
+            text = content if isinstance(content, str) else json.dumps(content)
+            ids.extend(range(len(text)))
+        ids.append(101)  # closing role-tag marker
+        return ids
+
+    def encode(self, text):
+        return list(range(len(text)))
+
+
+def test_single_message_token_count_template_aware():
+    from areno.api.openai_chat import single_message_token_count
+
+    message = {"role": "tool", "tool_call_id": "c1", "name": "f", "content": "hello"}
+    # Template-bearing tokenizer wraps the content with role-tag markers, so the
+    # count exceeds the raw content length -- same scale the full prompt render
+    # uses, not raw ``encode``.
+    assert single_message_token_count(_TemplateTokenizer(), message) == len("hello") + 2
+    # A tokenizer without a chat template falls back to raw content encode.
+    assert single_message_token_count(_CharTokenizer(), message) == len("hello")
+
+
+# ---------------------------------------------------------------------------
+# 13. filter diagnostics identify the oversized tool result (name + tokens)
+# ---------------------------------------------------------------------------
+
+
+def _policy_only_for_diagnostics():
+    from areno.api.trainers.policy_only import PolicyOnlyTrainer
+
+    return PolicyOnlyTrainer(
+        config=SimpleNamespace(), instance=object(), dataset=None, reward_fn=None, loss_fn=None
+    )
+
+
+def test_agent_filter_detail_includes_oversized_tool():
+    policy = _policy_only_for_diagnostics()
+    tokenizer = _CharTokenizer()
+
+    trainer = _FakeTrainer(world_size=1, tp_size=1)
+    trainer.config = SimpleNamespace(agent_overlength_policy="safe-stop", world_size=1, tp_size=1)
+    trainer.tokenizer = tokenizer
+    params = _FakeSamplingParams()
+    params.max_context_len = 10
+    session = _session(trainer, params=params)
+
+    over_messages = _tool_messages("b" * 25)
+    over_response = _complete(session, {"model": "policy", "messages": over_messages})
+    over_sample = _sample_from_response(session, over_response, messages=over_messages)
+    assert over_sample.termination_reason == "oversized_tool_result"
+
+    over_detail = policy._agent_sample_filter_detail(over_sample, token_len=999, tokenizer=tokenizer)
+    assert over_detail["oversized_tool"] == {"name": "f", "tokens": 25}
+
+    ctx_messages = [{"role": "user", "content": "a" * 15}]
+    ctx_response = _complete(session, {"model": "policy", "messages": ctx_messages})
+    ctx_sample = _sample_from_response(session, ctx_response, messages=ctx_messages)
+    assert ctx_sample.termination_reason == "context_limit"
+    ctx_detail = policy._agent_sample_filter_detail(ctx_sample, token_len=999, tokenizer=tokenizer)
+    assert ctx_detail["oversized_tool"] is None
+
+    diag = {
+        "max_context_len": 10,
+        "total": 2,
+        "kept": 0,
+        "filtered": 2,
+        "min_tokens": 999,
+        "p50_tokens": 999,
+        "p90_tokens": 999,
+        "max_tokens": 999,
+        "top": [over_detail, ctx_detail],
+    }
+    formatted = policy._format_agent_filter_diagnostics(diag)
+    assert "oversized_tool=name:f tokens:25" in formatted
+    assert "oversized_tool=name:none" not in formatted  # context_limit entry carries no suffix

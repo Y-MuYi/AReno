@@ -105,6 +105,41 @@ def messages_to_text(messages: list[dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
+def single_message_token_count(tokenizer, message: dict[str, Any]) -> int:
+    """Template-aware token count of one message rendered alone.
+
+    Renders the single message through the model's chat template with
+    ``add_generation_prompt=False`` so the count is on the same scale the full
+    prompt is measured (template/special-token aware), which is what the agentic
+    overlength classifier needs to decide whether a single tool result already
+    exceeds the context cap. Falls back to raw ``tokenizer.encode(text)`` when
+    the tokenizer has no chat template or the template cannot render the
+    message alone; returns ``0`` if even the fallback errors so the caller
+    treats the message as not-decidably-oversized.
+    """
+
+    content = message.get("content")
+    text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+    if getattr(tokenizer, "chat_template", None):
+        try:
+            return len(
+                normalize_token_ids(
+                    apply_chat_template_with_options(
+                        tokenizer,
+                        normalize_messages([message]),
+                        tokenize=True,
+                        add_generation_prompt=False,
+                    )
+                )
+            )
+        except Exception:
+            pass
+    try:
+        return len(tokenizer.encode(text))
+    except Exception:
+        return 0
+
+
 def first_user_text(messages: list[dict[str, Any]]) -> str:
     """Return the first user text, falling back to all text messages."""
 

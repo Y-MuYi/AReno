@@ -32,6 +32,7 @@ from areno.api.openai_chat import (
     messages_to_prompt_tokens,
     messages_to_text,
     normalize_messages,
+    single_message_token_count,
 )
 from areno.api.rewards import RewardEvent, RewardRecord
 from areno.api.tokenizer import apply_chat_template_with_options
@@ -957,24 +958,19 @@ def _classify_pre_generation_overlength(
 ) -> str:
     """Split a pre-generation context overflow into its cause.
 
-    Returns ``"oversized_tool_result"`` when the last ``role == "tool"``
-    message *on its own* already exceeds ``max_context_len`` tokens (the
-    trajectory is fine but a single tool result blew the cap); otherwise
-    ``"context_limit"`` (the accumulated trajectory simply grew too long).
+    Returns ``"oversized_tool_result"`` when *any* ``role == "tool"`` message
+    rendered on its own already exceeds ``max_context_len`` tokens (a single
+    tool result blew the cap, so trimming older turns cannot help); otherwise
+    ``"context_limit"`` (the accumulated trajectory simply grew too long). The
+    per-message count uses ``single_message_token_count`` so it is measured on
+    the same chat-template-aware scale as the full prompt, not raw ``encode``.
     """
 
-    for message in reversed(messages):
+    for message in messages:
         if message.get("role") != "tool":
             continue
-        content = message.get("content")
-        text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
-        try:
-            tool_tokens = tokenizer.encode(text)
-        except Exception:
-            return "context_limit"
-        if len(tool_tokens) > max_context_len:
+        if single_message_token_count(tokenizer, message) > max_context_len:
             return "oversized_tool_result"
-        return "context_limit"
     return "context_limit"
 
 

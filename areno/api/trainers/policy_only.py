@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 
 from areno.api.dashboard import record_dashboard_state
+from areno.api.openai_chat import single_message_token_count
 from areno.api.tokenizer import configure_chat_template_enable_thinking
 
 
@@ -232,8 +233,9 @@ class PolicyOnlyTrainer:
                     samples.append(sample)
                 else:
                     ctx._append_sample_response(existing, sample)
+            tokenizer = self.areno.get_tokenizer()
             samples, filtered_count, filter_diagnostics = self._filter_overlong_agent_samples(
-                ctx, samples, sampling_params
+                ctx, samples, sampling_params, tokenizer
             )
             overlength_counts = _aggregate_overlength_counts(samples)
             expected = len(agent_batch)
@@ -271,7 +273,7 @@ class PolicyOnlyTrainer:
                 overlength_counts=overlength_counts,
             )
 
-    def _filter_overlong_agent_samples(self, ctx, samples, sampling_params):
+    def _filter_overlong_agent_samples(self, ctx, samples, sampling_params, tokenizer=None):
         # Whole-trajectory backstop: under the safe-stop policy the proxy already
         # stops items at the overlength turn, so this filter should rarely drop
         # anything. It is retained for the ``off`` policy (which keeps partial
@@ -286,7 +288,7 @@ class PolicyOnlyTrainer:
         for sample in samples:
             rows = ctx._train_rows_from_samples([sample])
             token_len = len(rows.token_rows[0]) if rows.token_rows else 0
-            detail = self._agent_sample_filter_detail(sample, token_len)
+            detail = self._agent_sample_filter_detail(sample, token_len, tokenizer)
             all_details.append(detail)
             if token_len <= max_context_len:
                 kept.append(sample)
@@ -302,7 +304,7 @@ class PolicyOnlyTrainer:
             self.logger.warning("agentic trajectory filtered: %s", self._format_agent_filter_diagnostics(diagnostics))
         return kept, len(filtered_details), diagnostics
 
-    def _agent_sample_filter_detail(self, sample, token_len):
+    def _agent_sample_filter_detail(self, sample, token_len, tokenizer=None):
         tool_result_count = sum(1 for message in sample.messages if message.get("role") == "tool")
         assistant_count = sum(1 for message in sample.messages if message.get("role") == "assistant")
         return {
@@ -315,8 +317,29 @@ class PolicyOnlyTrainer:
             "response_tokens": len(sample.response_tokens),
             "trace_events": len(sample.trace),
             "termination_reason": sample.termination_reason,
+            "oversized_tool": self._oversized_tool_detail(sample, tokenizer),
             "prompt": str(sample.item.prompt).replace("\n", "\\n")[:120],
         }
+
+    def _oversized_tool_detail(self, sample, tokenizer) -> dict | None:
+        """Identify the largest tool result on an ``oversized_tool_result`` sample.
+
+        Populated only when the sample terminated on ``oversized_tool_result``
+        and a tokenizer is available; returns ``{"name", "tokens"}`` for the
+        tool message with the largest token count (without exposing its text)
+        so operators can see which tool result blew the cap. ``None`` otherwise.
+        """
+
+        if tokenizer is None or getattr(sample, "termination_reason", None) != "oversized_tool_result":
+            return None
+        largest: dict | None = None
+        for message in sample.messages:
+            if message.get("role") != "tool":
+                continue
+            tokens = single_message_token_count(tokenizer, message)
+            if largest is None or tokens > largest["tokens"]:
+                largest = {"name": message.get("name"), "tokens": int(tokens)}
+        return largest
 
     def _agent_filter_diagnostics(self, all_details, filtered_details, *, max_context_len, kept_count):
         token_lengths = sorted(detail["tokens"] for detail in all_details)
@@ -336,12 +359,7 @@ class PolicyOnlyTrainer:
         if not diagnostics:
             return "no context-length diagnostics available"
         top = "; ".join(
-            "prompt_idx={prompt_idx} sample_idx={sample_idx} tokens={tokens} messages={messages} "
-            "assistant_messages={assistant_messages} tool_results={tool_results} response_tokens={response_tokens} "
-            "trace_events={trace_events} termination_reason={termination_reason} prompt='{prompt}'".format(
-                **{"termination_reason": "none", **detail}
-            )
-            for detail in diagnostics.get("top", [])
+            self._format_agent_filter_top_entry(detail) for detail in diagnostics.get("top", [])
         )
         return (
             "max_context_len={max_context_len} total={total} kept={kept} filtered={filtered} "
@@ -357,6 +375,19 @@ class PolicyOnlyTrainer:
             max_tokens=diagnostics["max_tokens"],
             top=top,
         )
+
+    def _format_agent_filter_top_entry(self, detail: dict) -> str:
+        base = (
+            "prompt_idx={prompt_idx} sample_idx={sample_idx} tokens={tokens} messages={messages} "
+            "assistant_messages={assistant_messages} tool_results={tool_results} response_tokens={response_tokens} "
+            "trace_events={trace_events} termination_reason={termination_reason} prompt='{prompt}'"
+        ).format(**{"termination_reason": "none", "prompt": "", **detail})
+        oversized_tool = detail.get("oversized_tool")
+        if oversized_tool:
+            base += " oversized_tool=name:{name} tokens:{tokens}".format(
+                name=oversized_tool.get("name"), tokens=oversized_tool.get("tokens")
+            )
+        return base
 
     def _percentile_value(self, sorted_values, fraction):
         if not sorted_values:
